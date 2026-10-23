@@ -13,6 +13,8 @@
 
 An open-source Minecraft server panel built with **Tauri** (Rust + WebView) and backed by **[mcpanel-cli](https://github.com/DippyCoder/MCPanel-CLI)**.
 
+>**Note:** MCPanel and all MCPanel related repositorys will be at [MCPanel-Studios](https://github.com/MCPanel-Studios) soon!
+
 ---
 
 ## Features
@@ -42,9 +44,9 @@ An open-source Minecraft server panel built with **Tauri** (Rust + WebView) and 
 - **Import & duplicate** - Adopt an existing server folder, duplicate a configured server, or turn a server into a reusable profile
 - **Quick settings** - Change port, RAM, Java path, and arguments without opening a modal
 - **Storage tracking** - Server folder size with optional per-server storage limits
-- **Update checks** - Notifies you when a new MCPanel or `mcpanel-cli` release is out
+- **Update checks** - Notifies you when a new MCPanel or `mcpanel-cli` release is out; **Settings → Updates → Install updates automatically** installs new MCPanel and MCPanel-CLI releases on startup and every 6 hours. After an update, or after installing, updating or removing an addon, a toast offers to restart MCPanel for you (servers keep running)
 - **Diagnostic log** - MCPanel's own rotating log (CLI errors, install steps), separate from each server's console
-- **Theme system** - Install, browse, and swap themes live without restarting
+- **Theme system** - Install, browse, and swap themes live without restarting. Browse Online lists the official themes from MCPanel's [`themes` branch](https://github.com/DippyCoder/MCPanel/tree/themes) and community themes from [MCLib](https://github.com/DippyCoder/MCLib#themes)
   - Browse community themes and install with one click
   - Import any theme as a `.zip` or from a direct URL
   - Ships with **Purple Dark**, **Clean Dark**, **Dark Slate**, and **Bright Slate** built in
@@ -298,7 +300,7 @@ Community themes and authoring docs: [`themes` branch](https://github.com/DippyC
 - **Scheduled tasks only fire while MCPanel is open** - they are not system cron jobs.
 - **Backups** are plain `.zip` archives of the server folder, with `logs/` excluded to save space. Stop the server before restoring one.
 
-This README was created for MCPanel v2.3.0 and requires [MCPanel-CLI v1.4.0](https://github.com/DippyCoder/mcpanel-cli/releases) or newer!
+This README was created for MCPanel v2.4.0 and requires [MCPanel-CLI v1.5.0](https://github.com/DippyCoder/mcpanel-cli/releases) or newer!
 
 Error messages shown in the app come straight from MCPanel-CLI (`{"error": "<message>", "code": "<code>"}`) - the app keeps no list of its own, so errors added in newer CLI versions display correctly without an app update.
 

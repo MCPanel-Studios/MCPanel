@@ -315,7 +315,31 @@ pub async fn check_cli() -> Value {
     result
 }
 
-#[tauri::command]
+// argv joined for logging, with the values of `-password` and `-user`
+// (`db mysql …`) masked so a database login never lands in the app log - the
+// user too, since a password typed into the wrong field would end up there.
+fn loggable_argv(argv: &[String]) -> String {
+    let is_secret = |a: &str| matches!(a, "-password" | "--password" | "-user" | "--user");
+    argv.iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if i > 0 && is_secret(&argv[i - 1]) {
+                "***".to_string()
+            } else if ["-password=", "--password=", "-user=", "--user="].iter().any(|p| a.starts_with(p)) {
+                format!("{}=***", a.split('=').next().unwrap_or(""))
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// `async` runs it on Tauri's worker pool: a plain sync command runs on the
+// main (UI) thread, and every CLI spawn (~70 ms) froze the window - the
+// status poll alone makes one per server every 5 s. The same applies to the
+// other commands below that wait on a process or the network.
+#[tauri::command(async)]
 pub fn run_cli(args: Vec<String>) -> Result<String, String> {
     let mut argv = vec!["api".to_string()];
     argv.extend(args);
@@ -323,7 +347,7 @@ pub fn run_cli(args: Vec<String>) -> Result<String, String> {
     // noise when it's succeeding — only worth a log line when it fails.
     let is_fetch = argv.get(1).map(|s| s == "fetch").unwrap_or(false);
     if !is_fetch {
-        crate::app_log::info(format!("run_cli: mcpanel {}", argv.join(" ")));
+        crate::app_log::info(format!("run_cli: mcpanel {}", loggable_argv(&argv)));
     }
 
     let out = mcpanel_cmd()
@@ -335,7 +359,7 @@ pub fn run_cli(args: Vec<String>) -> Result<String, String> {
     if stdout.is_empty() && !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         if is_fetch {
-            crate::app_log::error(format!("run_cli: mcpanel {} failed: {}", argv.join(" "), stderr));
+            crate::app_log::error(format!("run_cli: mcpanel {} failed: {}", loggable_argv(&argv), stderr));
         } else {
             crate::app_log::error(format!("  error: {}", stderr));
         }
@@ -505,76 +529,66 @@ pub fn accept_eula(id: String) -> Result<String, String> {
     Ok(serde_json::json!({"success": true}).to_string())
 }
 
-// ─── Duplicate server (direct Rust impl) ─────────────────────────────────────
+// ─── Duplicate / clone server (with progress events) ─────────────────────────
 
+// Goes through the CLI (`duplicate server`) rather than copying natively: a
+// clone can switch version (downloading a new jar) and live in another folder,
+// and the CLI already owns that logic plus the cleanup when it fails half-way.
 #[tauri::command]
-pub async fn duplicate_server(id: String, new_name: String, app: AppHandle) -> Result<String, String> {
+pub async fn duplicate_server(args: Vec<String>, app: AppHandle) -> Result<String, String> {
+    let switches_version = args.iter().any(|a| a == "-v" || a == "--version");
+    let status_msg = if switches_version {
+        "Copying files & downloading new version…"
+    } else {
+        "Copying server files…"
+    };
     let _ = app.emit(
         "download-progress",
-        serde_json::json!({"id": "__dup__", "progress": 0, "status": "Copying server files…"}),
+        serde_json::json!({"id": "__dup__", "progress": 5, "status": status_msg}),
     );
 
-    let mut cfg = read_config()?;
-    let src = cfg["servers"]
-        .as_array()
-        .and_then(|arr| arr.iter().find(|s| s["id"].as_str() == Some(&id)))
-        .cloned()
-        .ok_or("Server not found")?;
+    let app2 = app.clone();
+    let ticker = tokio::spawn(async move {
+        let mut p = 5u8;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            p = (p + 10).min(88);
+            let _ = app2.emit(
+                "download-progress",
+                serde_json::json!({"id": "__dup__", "progress": p, "status": status_msg}),
+            );
+        }
+    });
 
-    let src_dir = src["dir"].as_str().ok_or("No dir")?.to_string();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let new_id = format!("srv_{}", now_ms);
-    let home = mcpanel_home();
-    let new_dir = format!("{}/servers/{}", home, new_id);
+    let mut argv = vec!["api".into(), "duplicate".into(), "server".into()];
+    argv.extend(args);
+    crate::app_log::info(format!("duplicate_server: mcpanel {}", argv.join(" ")));
 
-    std::fs::create_dir_all(&new_dir).map_err(|e| e.to_string())?;
-    copy_dir_all(&src_dir, &new_dir)?;
+    let out = mcpanel_async_cmd()
+        .args(&argv)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run mcpanel: {}", e))?;
 
-    let mut new_srv = src.clone();
-    new_srv["id"] = Value::String(new_id.clone());
-    new_srv["name"] = Value::String(new_name.clone());
-    new_srv["dir"] = Value::String(new_dir);
-    new_srv["created"] = Value::Number(serde_json::Number::from(now_ms as u64));
+    ticker.abort();
 
-    cfg["servers"]
-        .as_array_mut()
-        .ok_or("No servers array")?
-        .push(new_srv.clone());
-    write_config(&cfg)?;
-    write_server_manifest(&new_srv);
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let server_id = serde_json::from_str::<Value>(&stdout)
+        .ok()
+        .and_then(|v| v.pointer("/server/id").and_then(|id| id.as_str()).map(|s| s.to_string()))
+        .unwrap_or_else(|| "__dup__".into());
 
     let _ = app.emit(
         "download-progress",
-        serde_json::json!({"id": new_id, "progress": 100, "status": "Done!"}),
+        serde_json::json!({"id": server_id, "progress": 100, "status": "Done!"}),
     );
 
-    Ok(serde_json::json!({"success": true, "server": new_srv}).to_string())
-}
-
-// Skips profile.json and mcpanel.json — matches mcpanel-cli's util.copy_dir.
-// The manifest is skipped so the duplicate gets its own fresh one (written by
-// write_server_manifest above) instead of inheriting the source's id.
-fn copy_dir_all(src: &str, dst: &str) -> Result<(), String> {
-    for entry in
-        std::fs::read_dir(src).map_err(|e| format!("read_dir {}: {}", src, e))?
-    {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let name = entry.file_name();
-        if name == "profile.json" || name == "mcpanel.json" {
-            continue;
-        }
-        let dest_path = format!("{}/{}", dst, name.to_string_lossy());
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            std::fs::create_dir_all(&dest_path).map_err(|e| e.to_string())?;
-            copy_dir_all(&entry.path().display().to_string(), &dest_path)?;
-        } else {
-            std::fs::copy(entry.path(), &dest_path).map_err(|e| e.to_string())?;
-        }
+    if stdout.is_empty() && !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        crate::app_log::error(format!("  error: {}", stderr));
+        return Err(stderr);
     }
-    Ok(())
+    Ok(stdout)
 }
 
 // ─── Start server + log streaming ─────────────────────────────────────────────
@@ -1029,60 +1043,198 @@ pub fn delete_theme(id: String) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn check_app_update() -> Value {
-    let url = "https://api.github.com/repos/DippyCoder/MCPanel/releases/latest";
-    let mut curl = std::process::Command::new("curl");
-    curl.args(["-fsSL", "--max-time", "10", "-H", "User-Agent: MCPanel", url]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        curl.creation_flags(0x08000000);
-    }
-    match curl.output() {
-        Ok(o) if o.status.success() => {
-            serde_json::from_slice(&o.stdout).unwrap_or(Value::Null)
+// ─── GitHub fetches (MCPanel-Studios first, DippyCoder as fallback) ──────────
+//
+// The MCPanel repositories are moving from the DippyCoder account to the
+// MCPanel-Studios organisation. Every GitHub URL under the old owner is tried
+// at the organisation first and only then at its old path.
+
+const GITHUB_ORG: &str = "MCPanel-Studios";
+
+/// `[organisation URL, old URL]` for a DippyCoder GitHub URL, else `[url]`.
+pub(crate) fn github_candidates(url: &str) -> Vec<String> {
+    const HOSTS: [&str; 4] = [
+        "https://api.github.com/repos/",
+        "https://github.com/",
+        "https://raw.githubusercontent.com/",
+        "https://gist.githubusercontent.com/",
+    ];
+    for host in HOSTS {
+        if let Some(rest) = url.strip_prefix(host) {
+            if rest.len() > 11 && rest[..11].eq_ignore_ascii_case("DippyCoder/") {
+                return vec![format!("{}{}/{}", host, GITHUB_ORG, &rest[11..]), url.to_string()];
+            }
         }
-        _ => Value::Null,
     }
+    vec![url.to_string()]
 }
 
-#[tauri::command]
-pub fn check_cli_update() -> Value {
-    let url = "https://api.github.com/repos/DippyCoder/mcpanel-cli/releases/latest";
-    let mut curl = std::process::Command::new("curl");
-    curl.args(["-fsSL", "--max-time", "10", "-H", "User-Agent: MCPanel", url]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        curl.creation_flags(0x08000000);
-    }
-    match curl.output() {
-        Ok(o) if o.status.success() => {
-            serde_json::from_slice(&o.stdout).unwrap_or(Value::Null)
-        }
-        _ => Value::Null,
-    }
+/// GET `url` (with the organisation fallback) and parse it as JSON.
+fn curl_json(url: &str) -> Option<Value> {
+    github_candidates(url).iter().find_map(|candidate| curl_json_exact(candidate))
 }
 
-#[tauri::command]
-pub fn fetch_github_themes() -> Value {
-    let url = "https://raw.githubusercontent.com/DippyCoder/MCPanel/themes/themes-index.json";
+/// GET exactly `url`, no organisation fallback, and parse it as JSON.
+fn curl_json_exact(url: &str) -> Option<Value> {
     let mut curl = std::process::Command::new("curl");
-    curl.args(["-fsSL", "--max-time", "10", url]);
+    curl.args(["-fsSL", "--max-time", "10", "-H", "User-Agent: MCPanel", url]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         curl.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let out = curl.output();
-    match out {
-        Ok(o) if o.status.success() => {
-            let body = String::from_utf8_lossy(&o.stdout);
-            serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({"themes": []}))
-        }
-        _ => serde_json::json!({"themes": [], "error": "Failed to fetch themes"}),
+    let o = curl.output().ok()?;
+    if !o.status.success() {
+        return None;
     }
+    serde_json::from_slice::<Value>(&o.stdout).ok()
+}
+
+#[tauri::command(async)]
+pub fn check_app_update() -> Value {
+    curl_json("https://api.github.com/repos/DippyCoder/MCPanel/releases/latest").unwrap_or(Value::Null)
+}
+
+#[tauri::command(async)]
+pub fn check_cli_update() -> Value {
+    curl_json("https://api.github.com/repos/DippyCoder/mcpanel-cli/releases/latest").unwrap_or(Value::Null)
+}
+
+/// Settings → "Update MCPanel" / "Update CLI": runs `mcpanel api updateapp -p
+/// <product>`, the same code path as the terminal command. The CLI can't find
+/// this app's version or executable on its own (an AppImage it only sees via
+/// the inherited APPIMAGE variable), so they're passed in the environment.
+#[tauri::command]
+pub async fn update_app(app: AppHandle, product: String) -> Value {
+    if !matches!(product.as_str(), "mcpanel" | "cli") {
+        return serde_json::json!({"error": "Unknown product", "code": "invalid_arguments"});
+    }
+    let mut cmd = mcpanel_async_cmd();
+    cmd.args(["api", "updateapp", "-p", &product]);
+    cmd.env("MCPANEL_APP_VERSION", app.package_info().version.to_string());
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env("MCPANEL_APP_EXE", exe);
+    }
+    crate::app_log::info(format!("update_app: updating {}", product));
+    match cmd.output().await {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let line = out.lines().rev().find(|l| l.trim_start().starts_with('{')).unwrap_or("");
+            serde_json::from_str(line).unwrap_or_else(|_| {
+                let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                serde_json::json!({
+                    "error": if err.is_empty() { "MCPanel-CLI returned no result".to_string() } else { err },
+                    "code": "update_failed",
+                })
+            })
+        }
+        Err(e) => serde_json::json!({
+            "error": format!("MCPanel-CLI could not be started: {}", e),
+            "code": "cli_unavailable",
+        }),
+    }
+}
+
+/// Remote theme catalogues. MCPanel's (on its `themes` branch) lists the
+/// official themes with direct `downloadUrl`s. MCLib's (next to its addon
+/// index on `main`) is built like that addon index: entries only point at each theme's GitHub or
+/// Codeberg repository, and the version and `.zip` come from its releases.
+const MCPANEL_THEMES_INDEX: &str =
+    "https://raw.githubusercontent.com/DippyCoder/MCPanel/themes/themes-index.json";
+const MCLIB_THEMES_INDEX: &str =
+    "https://raw.githubusercontent.com/DippyCoder/MCLib/main/themes-index.json";
+
+/// `(version, zip URL)` of the newest non-draft, non-prerelease release of a
+/// GitHub/Codeberg `project`, taken from its first `.zip` asset, or the
+/// release's source archive when none is attached (the installer finds
+/// `theme.json` under the archive's wrapping folder). The release tag is the
+/// version. The project URL is used as listed (no organisation
+/// fallback): it names the theme's own repository, wherever that lives.
+fn latest_theme_release(project: &str) -> Option<(String, String)> {
+    let api = if let Some(rest) = project.strip_prefix("https://github.com/") {
+        format!("https://api.github.com/repos/{}/releases?per_page=20", rest)
+    } else if let Some(rest) = project.strip_prefix("https://codeberg.org/") {
+        format!("https://codeberg.org/api/v1/repos/{}/releases?limit=20", rest)
+    } else {
+        return None; // MCLib only lists GitHub and Codeberg projects
+    };
+    let releases = curl_json_exact(&api)?;
+    let release = releases.as_array()?.iter().find(|r| {
+        !r.get("draft").and_then(Value::as_bool).unwrap_or(false)
+            && !r.get("prerelease").and_then(Value::as_bool).unwrap_or(false)
+    })?;
+    let tag = release.get("tag_name")?.as_str()?;
+    let asset = release.get("assets").and_then(Value::as_array).and_then(|assets| {
+        assets.iter().find_map(|a| {
+            let name = a.get("name")?.as_str()?;
+            if !name.to_ascii_lowercase().ends_with(".zip") {
+                return None;
+            }
+            a.get("browser_download_url")?.as_str().map(str::to_string)
+        })
+    });
+    let zip = asset.or_else(|| release.get("zipball_url")?.as_str().map(str::to_string))?;
+    Some((tag.trim_start_matches(['v', 'V']).to_string(), zip))
+}
+
+/// An MCLib theme entry as a theme-browser card, or `None` if its repository
+/// has no installable release.
+fn mclib_theme_card(entry: &Value) -> Option<Value> {
+    let project = entry.get("project")?.as_str()?;
+    let (version, zip) = latest_theme_release(project)?;
+    let authors: Vec<&str> = entry
+        .get("authors")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    Some(serde_json::json!({
+        "name": entry.get("name")?,
+        "creator": authors.join(", "),
+        "creatorUrl": project,
+        "description": entry.get("description").cloned().unwrap_or(Value::Null),
+        "version": version,
+        "downloadUrl": zip,
+        "source": "mclib",
+    }))
+}
+
+#[tauri::command(async)]
+pub fn fetch_github_themes() -> Value {
+    let (official, mclib) = std::thread::scope(|s| {
+        let mclib = s.spawn(|| {
+            let index = curl_json(MCLIB_THEMES_INDEX)?;
+            let entries = index.get("themes")?.as_array()?.clone();
+            // One release lookup per theme, all at once.
+            let cards = std::thread::scope(|s| {
+                let handles: Vec<_> =
+                    entries.iter().map(|e| s.spawn(move || mclib_theme_card(e))).collect();
+                handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect::<Vec<_>>()
+            });
+            Some(cards)
+        });
+        let official = curl_json(MCPANEL_THEMES_INDEX).map(|v| {
+            v.get("themes")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter(|t| t.is_object())
+                        .map(|t| {
+                            let mut t = t.clone();
+                            t["source"] = Value::String("mcpanel".into());
+                            t
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+        (official, mclib.join().ok().flatten())
+    });
+
+    if official.is_none() && mclib.is_none() {
+        return serde_json::json!({"themes": [], "error": "Failed to fetch themes"});
+    }
+    let themes: Vec<Value> = official.into_iter().chain(mclib).flatten().collect();
+    serde_json::json!({"themes": themes})
 }
 
 #[tauri::command]
@@ -1090,7 +1242,7 @@ pub fn install_theme_from_file(path: String) -> Result<Value, String> {
     _install_theme_zip(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn install_theme_from_url(url: String) -> Result<Value, String> {
     let themes_dir = mcpanel_themes_dir();
     std::fs::create_dir_all(&themes_dir).map_err(|e| e.to_string())?;
@@ -1099,15 +1251,21 @@ pub fn install_theme_from_url(url: String) -> Result<Value, String> {
         .unwrap_or_default()
         .as_millis();
     let tmp = format!("{}/._download_{}.zip", themes_dir, ts);
-    let mut curl = std::process::Command::new("curl");
-    curl.args(["-fsSL", "--max-time", "60", "-o", &tmp, &url]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        curl.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let mut ok = false;
+    for candidate in github_candidates(&url) {
+        let mut curl = std::process::Command::new("curl");
+        curl.args(["-fsSL", "--max-time", "60", "-o", &tmp, &candidate]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            curl.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        if curl.status().map_err(|e| e.to_string())?.success() {
+            ok = true;
+            break;
+        }
     }
-    let status = curl.status().map_err(|e| e.to_string())?;
-    let result = if status.success() {
+    let result = if ok {
         _install_theme_zip(&tmp)
     } else {
         Err("Download failed".to_string())
@@ -1334,6 +1492,16 @@ pub async fn browse_folder(app: AppHandle) -> Option<String> {
 }
 
 #[tauri::command]
+pub async fn browse_folders(app: AppHandle) -> Vec<String> {
+    use tauri_plugin_dialog::{DialogExt, FilePath};
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<Vec<FilePath>>>();
+    app.dialog()
+        .file()
+        .pick_folders(move |p| { let _ = tx.send(p); });
+    rx.await.ok().flatten().unwrap_or_default().into_iter().map(filepath_to_string).collect()
+}
+
+#[tauri::command]
 pub async fn browse_file(
     app: AppHandle,
     title: String,
@@ -1380,15 +1548,22 @@ pub async fn install_cli() -> Result<String, String> {
     ];
 
     let mut last_err = String::new();
+    let mut attempts: Vec<(&str, &[&str], String)> = Vec::new();
     for (prog, prefix_args) in candidates {
+        for zip_url in github_candidates(ZIP_URL) {
+            attempts.push((prog, prefix_args, zip_url));
+        }
+    }
+    for (prog, prefix_args, zip_url) in &attempts {
+        let (prog, prefix_args) = (*prog, *prefix_args);
         let mut cmd = tokio::process::Command::new(prog);
-        cmd.args(*prefix_args);
-        cmd.arg(ZIP_URL);
+        cmd.args(prefix_args);
+        cmd.arg(zip_url);
         #[cfg(windows)]
         { use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); }
         match cmd.output().await {
             Ok(o) if o.status.success() => {
-                crate::app_log::info("install_cli: mcpanel-cli installed from GitHub zip");
+                crate::app_log::info(format!("install_cli: mcpanel-cli installed from {}", zip_url));
 
                 // On Windows, pip --user installs to a Scripts dir that isn't on PATH
                 // by default. Ask the same Python interpreter where it put the scripts,
@@ -1724,9 +1899,13 @@ fn walk_dir_tree(path: &std::path::Path, base: &std::path::Path) -> Value {
     if let Ok(read_dir) = std::fs::read_dir(path) {
         let mut items: Vec<_> = read_dir.flatten().collect();
         items.sort_by_key(|e| e.file_name());
+        // plugins/.list and mods/.list hold mcpanel-cli's install records —
+        // hidden from the file manager like the CLI's own server tree does.
+        let hide_list = matches!(path.file_name().and_then(|n| n.to_str()), Some("plugins" | "mods"));
         for entry in items {
             let Ok(meta) = entry.metadata() else { continue };
             let name = entry.file_name().to_string_lossy().to_string();
+            if hide_list && name == ".list" { continue; }
             let rel = entry.path()
                 .strip_prefix(base).unwrap_or(&entry.path())
                 .to_string_lossy().replace('\\', "/");
@@ -1982,6 +2161,35 @@ pub fn pty_close(state: tauri::State<'_, PtyState>) {
 
 #[tauri::command]
 pub fn quit_app(app: AppHandle) {
+    cancel_active_backup(&app);
+    app.exit(0);
+}
+
+/// The "Restart MCPanel" toast button after an update or an addon change:
+/// relaunches the same binary (for an AppImage, the AppImage file that was
+/// just swapped in place). Servers run under the CLI's supervisor, so they
+/// keep running across the restart.
+///
+/// A `cargo tauri dev` build can't relaunch itself: its frontend comes from
+/// the Tauri CLI's dev server, which shuts down as soon as the app exits, so
+/// the new process would only show "connection refused". There the windows
+/// are reloaded instead - enough for addon and CLI changes, which are picked
+/// up when the frontend starts.
+#[tauri::command]
+pub fn restart_app(app: AppHandle) -> Value {
+    if tauri::is_dev() {
+        crate::app_log::info("restart_app: dev build, reloading the window instead");
+        for (_, w) in app.webview_windows() {
+            let _ = w.reload();
+        }
+        return serde_json::json!({"success": true, "reloaded": true});
+    }
+    cancel_active_backup(&app);
+    crate::app_log::info("restart_app: restarting");
+    app.restart();
+}
+
+fn cancel_active_backup(app: &AppHandle) {
     // Cancel any in-progress backup and delete the partial zip
     if let Ok(mut guard) = app.state::<AppState>().active_backup.lock() {
         if let Some(bkp) = guard.take() {
@@ -1994,7 +2202,6 @@ pub fn quit_app(app: AppHandle) {
             }
         }
     }
-    app.exit(0);
 }
 
 // ─── App settings ─────────────────────────────────────────────────────────────
@@ -2061,7 +2268,7 @@ pub async fn shutdown_all_servers() -> Value {
 
 // ─── System fonts ─────────────────────────────────────────────────────────────
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_system_fonts() -> Vec<String> {
     #[cfg(windows)]
     {
@@ -2177,7 +2384,7 @@ pub fn get_velocity_secret(id: String) -> Value {
 
 // ─── System stats (RAM + CPU load) ───────────────────────────────────────────
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_system_stats() -> Value {
     #[cfg(windows)]
     return get_system_stats_windows();

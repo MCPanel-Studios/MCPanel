@@ -52,6 +52,13 @@
     }
   }
 
+  // -id / --profile-id for the `plugins …` commands.
+  function _pluginTargetArgs(opts) {
+    if (opts.serverId) return ['-id', opts.serverId];
+    if (opts.profileId) return ['--profile-id', opts.profileId];
+    return [];
+  }
+
   // cli(), but a failure to run the CLI at all also becomes an {error, code}
   // value - for calls whose callers only ever check `.error`.
   async function cliResult(args) {
@@ -151,6 +158,8 @@
       if (data.profileId) args.push('-profile', data.profileId);
       if (data.storageLimit) args.push('-storage', data.storageLimit);
       if (data.unstableBuilds) args.push('--unstable');
+      if (data.dest) args.push('-dest', data.dest);
+      if (data.heap) args.push('-heap', data.heap);
       const raw = await _invoke('create_server', { args });
       return JSON.parse(raw);
     },
@@ -214,9 +223,13 @@
       return JSON.parse(raw);
     },
 
-    getServerDirStats: async (id) => {
-      const result = await cli(['fetch', 'stats', '-id', id]);
-      return result && typeof result.size === 'number' ? result : { size: 0 };
+    // noSize: skip the disk-usage walk (RAM / CPU / max players only).
+    getServerDirStats: async (id, { noSize = false } = {}) => {
+      const args = ['fetch', 'stats', '-id', id];
+      if (noSize) args.push('--no-size');
+      const result = await cli(args);
+      if (!result || result.error) return noSize ? {} : { size: 0 };
+      return noSize || typeof result.size === 'number' ? result : { ...result, size: 0 };
     },
 
     // Profiles
@@ -259,7 +272,11 @@
     }),
 
     // Import / scan / duplicate
+    // Databases page: `mcpanel api db <args>` (list/tables/rows/update/insert/delete/mysql).
+    db: (args) => cliResult(['db', ...args]),
+
     browseFolder: () => _invoke('browse_folder'),
+    browseFolders: () => _invoke('browse_folders'),
 
     scanServerFolder: (path) =>
       cli(['scan', 'server', '-path', path]),
@@ -365,8 +382,13 @@
       return cli(['create', 'profile-from-server', ...args]);
     },
 
-    duplicateServer: async (id, newName) => {
-      const raw = await _invoke('duplicate_server', { id, newName });
+    // version: switch the copy to another version of the same software;
+    // dest: parent folder for the copy (default: MCPanel's servers folder).
+    duplicateServer: async (id, newName, { version = null, dest = null } = {}) => {
+      const args = ['-id', id, '-t', newName];
+      if (version) args.push('-v', version);
+      if (dest) args.push('-dest', dest);
+      const raw = await _invoke('duplicate_server', { args });
       return JSON.parse(raw);
     },
 
@@ -384,6 +406,12 @@
       if (customIp) args.push('--custom-ip', String(customIp));
       return cliResult(args);
     },
+
+    unlinkFromProxy: (paperId) =>
+      cliResult(['proxy', 'unlink', '-id', String(paperId)]),
+
+    syncProxyPort: (paperId) =>
+      cliResult(['proxy', 'sync-port', '-id', String(paperId)]),
 
     // Velocity
     getVelocitySecret: (id) => _invoke('get_velocity_secret', { id }),
@@ -428,6 +456,12 @@
         return { current: null, latest: null, hasUpdate: false };
       }
     },
+
+    // Settings → Update buttons: `mcpanel api updateapp -p <mcpanel|cli>`
+    updateApp: (product) => _invoke('update_app', { product }),
+
+    // "Restart MCPanel" toast button (after an update or an addon change)
+    restartApp: () => _invoke('restart_app'),
 
     // BuildTools (SpigotMC) — installed/latest build + manual update trigger
     getBuildToolsVersion: () => cli(['buildtools', 'version']),
@@ -508,8 +542,15 @@
       if (opts.mcVersion) args.push('-v', opts.mcVersion);
       if (opts.owner) args.push('--owner', opts.owner);
       if (opts.versionId) args.push('--version', String(opts.versionId));
+      if (opts.yes) args.push('--yes');
       return cli(args);
     },
+    // The plugins/mods installed through MCPanel (the CLI's .list records).
+    listPlugins: (opts = {}) => cli(['plugins', 'list', ..._pluginTargetArgs(opts)]),
+    uninstallPlugin: (platform, id, opts = {}) =>
+      cli(['plugins', 'uninstall', platform, id, ..._pluginTargetArgs(opts)]),
+    updatePlugin: (platform, id, opts = {}) =>
+      cli(['plugins', 'update', platform, id, ..._pluginTargetArgs(opts)]),
     pluginInfo: (platform, slug, opts = {}) => {
       const args = ['info', 'plugin', platform, slug];
       if (opts.owner) args.push('--owner', opts.owner);
