@@ -21,7 +21,7 @@ echo "  MCPanel - Minecraft Server Panel"
 echo "  =================================="
 echo ""
 echo "  No release binary found."
-echo "  Building — this takes ~5-10 min on first run."
+echo "  Building - this takes ~5-10 min on first run."
 echo "  Subsequent runs with ./run.sh will be instant."
 echo ""
 

@@ -17,8 +17,12 @@ Write-Log "Script path: $PSCommandPath"
 Write-Log "PSScriptRoot: $PSScriptRoot"
 Write-Log "Working dir: $(Get-Location)"
 
-$url = 'https://github.com/DippyCoder/mcpanel-cli/archive/refs/heads/main.zip'
-Write-Log "Install URL: $url"
+# MCPanel-Studios first; the old DippyCoder repository as a fallback.
+$urls = @(
+    'https://github.com/MCPanel-Studios/mcpanel-cli/archive/refs/heads/main.zip',
+    'https://github.com/DippyCoder/mcpanel-cli/archive/refs/heads/main.zip'
+)
+Write-Log "Install URLs: $($urls -join ', ')"
 
 $installed = $false
 
@@ -37,20 +41,23 @@ foreach ($py in @('py', 'python', 'python3')) {
         $pipOut = $null
         foreach ($flags in @('', '--user')) {
             $flagsLabel = if ($flags) { $flags } else { '(system-wide)' }
-            Write-Log "  pip install $flagsLabel ..."
-            if ($flags) {
-                $pipOut = & $py -m pip install $flags $url 2>&1
-            } else {
-                $pipOut = & $py -m pip install $url 2>&1
+            foreach ($url in $urls) {
+                Write-Log "  pip install $flagsLabel $url ..."
+                if ($flags) {
+                    $pipOut = & $py -m pip install $flags $url 2>&1
+                } else {
+                    $pipOut = & $py -m pip install $url 2>&1
+                }
+                Write-Log "  pip output: $pipOut"
+                Write-Log "  pip exit: $LASTEXITCODE"
+                if ($LASTEXITCODE -eq 0) { break }
             }
-            Write-Log "  pip output: $pipOut"
-            Write-Log "  pip exit: $LASTEXITCODE"
             if ($LASTEXITCODE -eq 0) { break }
-            Write-Log "  pip install $flagsLabel failed — trying next mode"
+            Write-Log "  pip install $flagsLabel failed - trying next mode"
         }
 
         if ($LASTEXITCODE -ne 0) {
-            Write-Log "  All pip modes failed — trying next Python command"
+            Write-Log "  All pip modes failed - trying next Python command"
             continue
         }
 
@@ -74,7 +81,7 @@ foreach ($py in @('py', 'python', 'python3')) {
                 Write-Log "  Already in Machine PATH: $scriptsPath"
             }
         } else {
-            Write-Log "  WARNING: Could not determine scripts directory — PATH not updated"
+            Write-Log "  WARNING: Could not determine scripts directory - PATH not updated"
         }
 
         $installed = $true
@@ -89,7 +96,7 @@ foreach ($py in @('py', 'python', 'python3')) {
 if (-not $installed) {
     Write-Log 'WARNING: Could not install mcpanel-cli.'
     Write-Log '  Python was not found or pip failed for all launchers tried.'
-    Write-Log "  Manual install: pip install $url"
+    Write-Log "  Manual install: pip install $($urls[-1])"
     Write-Log "  See log: $logFile"
 }
 

@@ -13,7 +13,7 @@ fn main() {
             "--version" | "-V" | "--help" | "-h" | "api" | "start" | "stop"
                 | "restart" | "kill" | "fetch" | "list" | "create" | "delete"
                 | "import" | "scan" | "detect-jdk" | "system" | "versions"
-                | "open" | "config"
+                | "open" | "config" | "updateapp"
         )
     }) {
         std::process::exit(1);

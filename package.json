@@ -1,6 +1,6 @@
 {
   "name": "mcpanel",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "Minecraft Server Panel",
   "scripts": {
     "tauri:dev": "cd src-tauri && cargo tauri dev",
@@ -9,6 +9,6 @@
   },
   "author": {
     "name": "DippyCoder",
-    "email": "planewriter255@gmail.com"
+    "email": "dippycoder@gmail.com"
   }
 }

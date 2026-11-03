@@ -32,7 +32,7 @@
     FileClose $R0
 
     DetailPrint "mcpanel-cli: bundled script not found, running inline pip install..."
-    nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& { Add-Content -Path ([IO.Path]::Combine($env:TEMP,''mcpanel-cli-install.log'')) -Value ''[inline] attempting pip install...''; foreach ($py in @(''py'',''python'',''python3'')) { $o = & $py -m pip install https://github.com/DippyCoder/mcpanel-cli/archive/refs/heads/main.zip 2>&1; Add-Content -Path ([IO.Path]::Combine($env:TEMP,''mcpanel-cli-install.log'')) -Value (''[$py] '' + $o + '' exit:'' + $LASTEXITCODE); if ($LASTEXITCODE -eq 0) { break } } }"'
+    nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& { Add-Content -Path ([IO.Path]::Combine($env:TEMP,''mcpanel-cli-install.log'')) -Value ''[inline] attempting pip install...''; foreach ($py in @(''py'',''python'',''python3'')) { foreach ($owner in @(''MCPanel-Studios'',''DippyCoder'')) { $o = & $py -m pip install https://github.com/$owner/mcpanel-cli/archive/refs/heads/main.zip 2>&1; Add-Content -Path ([IO.Path]::Combine($env:TEMP,''mcpanel-cli-install.log'')) -Value (''[$py $owner] '' + $o + '' exit:'' + $LASTEXITCODE); if ($LASTEXITCODE -eq 0) { break } }; if ($LASTEXITCODE -eq 0) { break } } }"'
     Pop $R1
     FileOpen $R0 "$TEMP\mcpanel-cli-install.log" a
     FileWrite $R0 "Inline install exited: $R1$\r$\n"
